@@ -39,7 +39,7 @@ including per-user `Match` overrides of `PasswordAuthentication`.
   can over-report.
 - It shows whether the bug applies. It does not show whether a host was
   already compromised. Check your auth logs.
-- Tested on Alpine 3.20 and Ubuntu 22.04 containers, not on every distro.
+- Tested in containers on Alpine 3.20 (with and without PAM, with and without `ldd`/`getent`), Debian 12, Ubuntu 20.04/22.04/24.04, Rocky 9, Fedora, Arch and openSUSE Leap 15. Not tested on real OpenWrt or Void-musl hosts.
 
 ## License
 

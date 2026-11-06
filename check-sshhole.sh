@@ -28,11 +28,28 @@ finish() { # code colour label detail
 
 printf 'sshhole check on %s (%s)\n\n' "$(hostname 2>/dev/null)" "$(uname -sr)"
 
+if [ "$(uname -s)" != Linux ]; then
+    finish 0 "$G" "NOT AFFECTED" "musl is a Linux libc; this bug does not apply on $(uname -s)."
+fi
+
 # 1. Is OpenSSH sshd installed?
-SSHD=$(command -v sshd 2>/dev/null)
+# Prefer the binary that is actually running. Alpine's PAM build is a separate "sshd.pam".
+SSHD=
+for pid in $(pgrep '^sshd' 2>/dev/null); do  # busybox matches the rewritten title, so no -x
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    case "$exe" in
+        */sshd|*/sshd.pam) [ -x "$exe" ] && { SSHD=$exe; RUNNING=yes; break; } ;;
+    esac
+done
 if [ -z "$SSHD" ]; then
-    for p in /usr/sbin/sshd /sbin/sshd /usr/local/sbin/sshd; do
-        [ -x "$p" ] && SSHD=$p && break
+    for n in sshd sshd.pam; do
+        SSHD=$(command -v "$n" 2>/dev/null)
+        if [ -z "$SSHD" ]; then
+            for d in /usr/sbin /sbin /usr/local/sbin; do
+                [ -x "$d/$n" ] && SSHD=$d/$n && break
+            done
+        fi
+        [ -n "$SSHD" ] && break
     done
 fi
 if [ -z "$SSHD" ]; then
@@ -40,6 +57,13 @@ if [ -z "$SSHD" ]; then
     finish 0 "$G" "NOT AFFECTED" "No OpenSSH server is installed here (Dropbear and others are not affected)."
 fi
 info "sshd: $SSHD"
+if [ "$RUNNING" = yes ]; then info "sshd running: yes"
+elif command -v pgrep >/dev/null 2>&1; then info "sshd running: no (installed only)"
+fi
+case "$SSHD" in
+    */sshd.pam) ;;
+    *) if [ -x "${SSHD}.pam" ]; then info "note: ${SSHD}.pam (PAM build) is also installed; if your service runs that one, UsePAM applies"; fi ;;
+esac
 
 # 2. Which libc does sshd use?
 libc_out="$(ldd "$SSHD" 2>&1; ldd --version 2>&1)"
@@ -48,6 +72,12 @@ case "$libc_out" in
     *GLIBC*|*"GNU libc"*|*libc.so.6*) libc=glibc ;;
     *) libc=unknown ;;
 esac
+if [ "$libc" = unknown ]; then # no ldd (e.g. OpenWrt, minimal images): inspect the binary and loaders
+    if grep -aq 'ld-musl' "$SSHD" 2>/dev/null; then libc=musl
+    elif grep -aqE 'ld-linux|libc\.so\.6' "$SSHD" 2>/dev/null; then libc=glibc
+    elif ls /lib/ld-musl-* >/dev/null 2>&1 && ! ls /lib*/ld-linux* /usr/lib*/ld-linux* >/dev/null 2>&1; then libc=musl
+    fi
+fi
 info "libc: $libc"
 case $libc in
     glibc) finish 0 "$G" "NOT AFFECTED" "glibc systems are not affected by this bug." ;;
@@ -75,7 +105,19 @@ if [ "$(id -u)" != 0 ]; then
     finish 2 "$Y" "INCONCLUSIVE" "musl detected, but the config and shadow file need root. Re-run with: sudo sh $0"
 fi
 
-cfg=$("$SSHD" -T 2>&1) || finish 2 "$Y" "INCONCLUSIVE" "'sshd -T' failed: $(printf '%s' "$cfg" | head -n1)"
+HK=
+if ! cfg=$("$SSHD" -T 2>&1); then
+    # Commonly "no hostkeys available": retry with a throwaway key just to dump the config
+    tmp=$(mktemp -d 2>/dev/null)
+    if [ -n "$tmp" ] && command -v ssh-keygen >/dev/null 2>&1 &&
+       ssh-keygen -q -t ed25519 -N '' -f "$tmp/k" >/dev/null 2>&1; then
+        trap 'rm -rf "$tmp"' EXIT
+        HK="-h $tmp/k"
+        cfg=$("$SSHD" -T $HK 2>&1)
+    fi
+    [ -n "$HK" ] && printf '%s\n' "$cfg" | grep -q '^passwordauthentication' ||
+        finish 2 "$Y" "INCONCLUSIVE" "'sshd -T' failed: $(printf '%s' "$cfg" | head -n1)"
+fi
 usepam=$(printf '%s\n' "$cfg" | awk '$1=="usepam"{print $2; exit}')
 pwauth=$(printf '%s\n' "$cfg" | awk '$1=="passwordauthentication"{print $2; exit}')
 [ -z "$usepam" ] && usepam=no  # sshd built without PAM omits the option from 'sshd -T'
@@ -94,11 +136,12 @@ shadow=$(getent shadow 2>/dev/null)
 exposed=
 for u in $(printf '%s\n' "$shadow" | awk -F: '$2=="*"{print $1}'); do
     shell=$(getent passwd "$u" 2>/dev/null | cut -d: -f7)
+    [ -z "$shell" ] && shell=$(awk -F: -v u="$u" '$1==u{print $7; exit}' /etc/passwd 2>/dev/null)
     case "$shell" in
         */nologin|*/false|*/sync|*/halt|*/shutdown) continue ;;
     esac
     # Match blocks may re-enable passwords for a specific user
-    ucfg=$("$SSHD" -T -C "user=$u,host=localhost,addr=127.0.0.1" 2>/dev/null) || ucfg=$cfg
+    ucfg=$("$SSHD" -T $HK -C "user=$u,host=localhost,addr=127.0.0.1" 2>/dev/null) || ucfg=$cfg
     upw=$(printf '%s\n' "$ucfg" | awk '$1=="passwordauthentication"{print $2; exit}')
     if [ "$upw" = yes ]; then
         exposed="$exposed $u"
